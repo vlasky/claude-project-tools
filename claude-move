@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: claude-move <old-path> <new-path>
+
+Moves a project directory and updates Claude Code's internal metadata
+to reflect the new location.
+
+Paths can be relative or absolute. The old path must exist (or use
+--metadata-only to update metadata without moving files).
+
+Options:
+  --metadata-only   Only update Claude Code metadata (don't move the directory)
+  --dry-run         Show what would be changed without making modifications
+  -h, --help        Show this help message
+
+Examples:
+  claude-move /home/user/projects/myapp /home/user/work/myapp
+  claude-move --metadata-only /old/path /new/path
+  claude-move --dry-run /home/user/projects/myapp /home/user/work/myapp
+EOF
+    exit 0
+}
+
+METADATA_ONLY=false
+DRY_RUN=false
+OLD_PATH=""
+NEW_PATH=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --metadata-only) METADATA_ONLY=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage ;;
+        -*) echo "Error: Unknown option $1" >&2; exit 1 ;;
+        *)
+            if [[ -z "$OLD_PATH" ]]; then
+                OLD_PATH="$1"
+            elif [[ -z "$NEW_PATH" ]]; then
+                NEW_PATH="$1"
+            else
+                echo "Error: Too many arguments" >&2; exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$OLD_PATH" || -z "$NEW_PATH" ]]; then
+    usage
+fi
+
+# Resolve to absolute paths and normalize (no external dependencies)
+resolve_path() {
+    local path="$1"
+    if [[ "$path" != /* ]]; then
+        path="$PWD/$path"
+    fi
+    # Normalize: collapse //, resolve /./ and /../
+    local result=""
+    local IFS='/'
+    local parts
+    read -ra parts <<< "$path"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ''|'.') continue ;;
+            '..')
+                result="${result%/*}"
+                ;;
+            *)
+                result="$result/$part"
+                ;;
+        esac
+    done
+    echo "${result:-/}"
+}
+
+OLD_PATH=$(resolve_path "$OLD_PATH")
+NEW_PATH=$(resolve_path "$NEW_PATH")
+
+# Normalize: remove trailing slashes
+OLD_PATH="${OLD_PATH%/}"
+NEW_PATH="${NEW_PATH%/}"
+
+if [[ "$OLD_PATH" == "$NEW_PATH" ]]; then
+    echo "Error: Old and new paths are the same" >&2
+    exit 1
+fi
+
+CLAUDE_DIR="${HOME}/.claude"
+
+if [[ ! -d "$CLAUDE_DIR" ]]; then
+    echo "Error: ~/.claude directory not found" >&2
+    exit 1
+fi
+
+# --- Helper functions ---
+
+# Escape a string for use as a sed replacement pattern
+sed_escape() {
+    printf '%s' "$1" | sed 's/[&/\]/\\&/g'
+}
+
+# Escape a string for use as a sed search pattern
+sed_escape_pattern() {
+    printf '%s' "$1" | sed 's/[][\/.^$*]/\\&/g'
+}
+
+# Convert path to Claude's directory naming scheme: /foo/bar -> -foo-bar
+path_to_dirname() {
+    echo "$1" | sed 's|/|-|g'
+}
+
+# Check if Claude Code is currently running with the given project path
+check_claude_running() {
+    local path="$1"
+    local pids_found=()
+
+    if [[ -d "$CLAUDE_DIR/sessions" ]]; then
+        for session_file in "$CLAUDE_DIR/sessions"/*.json; do
+            [[ -f "$session_file" ]] || continue
+            if grep -q "\"cwd\":\"$path\"\\|\"cwd\": \"$path\"" "$session_file" 2>/dev/null; then
+                local pid
+                pid=$(grep -o '"pid":[0-9]*' "$session_file" | head -1 | grep -o '[0-9]*')
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    pids_found+=("$pid")
+                fi
+            fi
+        done
+    fi
+
+    if [[ ${#pids_found[@]} -gt 0 ]]; then
+        echo "Error: Claude Code appears to be running for this project (PID: ${pids_found[*]})" >&2
+        echo "Please close Claude Code sessions for this project before moving." >&2
+        return 1
+    fi
+    return 0
+}
+
+# --- Backup and rollback ---
+
+BACKUP_DIR=""
+BACKUP_MANIFEST=()
+DIR_MOVED=false
+
+create_backup_dir() {
+    BACKUP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/claude-move-backup.XXXXXXXX")
+}
+
+backup_file() {
+    local file="$1"
+    if [[ -z "$BACKUP_DIR" ]]; then
+        create_backup_dir
+    fi
+    local backup_name
+    backup_name=$(echo "$file" | sed "s|$HOME/||; s|/|__|g")
+    cp "$file" "$BACKUP_DIR/$backup_name"
+    BACKUP_MANIFEST+=("$file|$BACKUP_DIR/$backup_name")
+}
+
+rollback() {
+    echo "" >&2
+    echo "Error occurred — rolling back changes..." >&2
+
+    # Restore backed-up files
+    for entry in "${BACKUP_MANIFEST[@]}"; do
+        local orig="${entry%%|*}"
+        local backup="${entry##*|}"
+        if [[ -f "$backup" ]]; then
+            cp "$backup" "$orig"
+            echo "  Restored: $orig" >&2
+        fi
+    done
+
+    # Undo project directory rename if it happened
+    if [[ -d "$PROJECTS_DIR/$NEW_DIRNAME" && ! -d "$PROJECTS_DIR/$OLD_DIRNAME" ]]; then
+        mv "$PROJECTS_DIR/$NEW_DIRNAME" "$PROJECTS_DIR/$OLD_DIRNAME"
+        echo "  Restored: projects/$OLD_DIRNAME" >&2
+    fi
+
+    # Undo file move if it happened
+    if [[ "$DIR_MOVED" == true && -d "$NEW_PATH" && ! -d "$OLD_PATH" ]]; then
+        mv "$NEW_PATH" "$OLD_PATH"
+        echo "  Restored: $OLD_PATH" >&2
+    fi
+
+    cleanup_backup
+    echo "Rollback complete. No changes were applied." >&2
+    exit 1
+}
+
+cleanup_backup() {
+    if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
+        rm -rf "$BACKUP_DIR"
+    fi
+}
+
+# --- Main logic ---
+
+OLD_DIRNAME=$(path_to_dirname "$OLD_PATH")
+NEW_DIRNAME=$(path_to_dirname "$NEW_PATH")
+PROJECTS_DIR="$CLAUDE_DIR/projects"
+
+# Prepare sed-safe versions of paths (boundary-aware replacement)
+# Match the old path only when followed by a quote, slash, or end-of-field
+OLD_SED=$(sed_escape_pattern "$OLD_PATH")
+NEW_SED=$(sed_escape "$NEW_PATH")
+
+echo "Claude Code Project Mover"
+echo "========================="
+echo "Old path: $OLD_PATH"
+echo "New path: $NEW_PATH"
+echo ""
+
+if [[ "$DRY_RUN" == true ]]; then
+    echo "[DRY RUN MODE - no changes will be made]"
+    echo ""
+fi
+
+# Pre-flight checks
+if [[ "$DRY_RUN" == false ]]; then
+    check_claude_running "$OLD_PATH"
+fi
+
+# Check for metadata collision
+if [[ -d "$PROJECTS_DIR/$NEW_DIRNAME" ]]; then
+    echo "Error: Metadata already exists for destination path: $PROJECTS_DIR/$NEW_DIRNAME" >&2
+    echo "If you previously had a project at the new path, remove its metadata first." >&2
+    exit 1
+fi
+
+# Step 1: Move the actual directory (unless --metadata-only)
+if [[ "$METADATA_ONLY" == false ]]; then
+    if [[ ! -d "$OLD_PATH" ]]; then
+        echo "Error: Source directory does not exist: $OLD_PATH" >&2
+        exit 1
+    fi
+    if [[ -e "$NEW_PATH" ]]; then
+        if [[ -d "$NEW_PATH" ]]; then
+            suggested="$NEW_PATH/$(basename "$OLD_PATH")"
+            echo "Error: Destination is an existing directory: $NEW_PATH" >&2
+            echo "Did you mean: claude-move $OLD_PATH $suggested" >&2
+        else
+            echo "Error: Destination already exists: $NEW_PATH" >&2
+        fi
+        exit 1
+    fi
+
+    NEW_PARENT=$(dirname "$NEW_PATH")
+    if [[ ! -d "$NEW_PARENT" ]]; then
+        echo "Error: Parent directory of destination does not exist: $NEW_PARENT" >&2
+        exit 1
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[Would move] $OLD_PATH -> $NEW_PATH"
+    else
+        mv "$OLD_PATH" "$NEW_PATH"
+        DIR_MOVED=true
+        echo "[Moved] $OLD_PATH -> $NEW_PATH"
+    fi
+else
+    echo "[Metadata-only mode: skipping directory move]"
+fi
+echo ""
+
+# From here on, set a trap to rollback on failure (only in non-dry-run mode)
+if [[ "$DRY_RUN" == false ]]; then
+    trap rollback ERR
+fi
+
+changes=0
+
+# Step 2: Rename the project directory under ~/.claude/projects/
+if [[ -d "$PROJECTS_DIR/$OLD_DIRNAME" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[Would rename] projects/$OLD_DIRNAME -> projects/$NEW_DIRNAME"
+    else
+        # Back up all files inside before renaming
+        for f in "$PROJECTS_DIR/$OLD_DIRNAME"/*.jsonl; do
+            [[ -f "$f" ]] && backup_file "$f"
+        done
+        mv "$PROJECTS_DIR/$OLD_DIRNAME" "$PROJECTS_DIR/$NEW_DIRNAME"
+        echo "[Renamed] projects/$OLD_DIRNAME -> projects/$NEW_DIRNAME"
+    fi
+    changes=$((changes + 1))
+fi
+
+# Handle sub-project directories
+for dir in "$PROJECTS_DIR"/${OLD_DIRNAME}-*; do
+    if [[ -d "$dir" ]]; then
+        basename_dir=$(basename "$dir")
+        suffix="${basename_dir#"$OLD_DIRNAME"}"
+        new_name="${NEW_DIRNAME}${suffix}"
+
+        if [[ -d "$PROJECTS_DIR/$new_name" ]]; then
+            echo "Warning: Skipping sub-project rename, destination exists: projects/$new_name" >&2
+            continue
+        fi
+
+        if [[ "$DRY_RUN" == true ]]; then
+            echo "[Would rename] projects/$basename_dir -> projects/$new_name"
+        else
+            for f in "$dir"/*.jsonl; do
+                [[ -f "$f" ]] && backup_file "$f"
+            done
+            mv "$dir" "$PROJECTS_DIR/$new_name"
+            echo "[Renamed] projects/$basename_dir -> projects/$new_name"
+        fi
+        changes=$((changes + 1))
+    fi
+done
+
+# Step 3: Update session files (cwd field)
+# Use boundary-aware matching: path must be preceded by a quote and followed by quote or nothing
+SESSIONS_DIR="$CLAUDE_DIR/sessions"
+if [[ -d "$SESSIONS_DIR" ]]; then
+    for session_file in "$SESSIONS_DIR"/*.json; do
+        [[ -f "$session_file" ]] || continue
+        if grep -q "\"${OLD_PATH}\"" "$session_file" 2>/dev/null; then
+            if [[ "$DRY_RUN" == true ]]; then
+                echo "[Would update] sessions/$(basename "$session_file")"
+            else
+                backup_file "$session_file"
+                # Replace only exact path occurrences (surrounded by quotes)
+                sed -i "s|\"${OLD_SED}\"|\"${NEW_SED}\"|g" "$session_file"
+                echo "[Updated] sessions/$(basename "$session_file")"
+            fi
+            changes=$((changes + 1))
+        fi
+    done
+fi
+
+# Step 4: Update history.jsonl (project field)
+HISTORY_FILE="$CLAUDE_DIR/history.jsonl"
+if [[ -f "$HISTORY_FILE" ]]; then
+    if grep -q "\"${OLD_PATH}\"" "$HISTORY_FILE" 2>/dev/null; then
+        if [[ "$DRY_RUN" == true ]]; then
+            count=$(grep -c "\"${OLD_PATH}\"" "$HISTORY_FILE")
+            echo "[Would update] history.jsonl ($count lines)"
+        else
+            backup_file "$HISTORY_FILE"
+            sed -i "s|\"${OLD_SED}\"|\"${NEW_SED}\"|g" "$HISTORY_FILE"
+            count=$(grep -c "\"${NEW_PATH}\"" "$HISTORY_FILE" || true)
+            echo "[Updated] history.jsonl ($count lines updated)"
+        fi
+        changes=$((changes + 1))
+    fi
+fi
+
+# Step 5: Update cwd references inside session JSONL files
+TARGET_PROJECT_DIR="$PROJECTS_DIR/$NEW_DIRNAME"
+if [[ "$DRY_RUN" == true ]]; then
+    TARGET_PROJECT_DIR="$PROJECTS_DIR/$OLD_DIRNAME"
+fi
+
+if [[ -d "$TARGET_PROJECT_DIR" ]]; then
+    for jsonl_file in "$TARGET_PROJECT_DIR"/*.jsonl; do
+        [[ -f "$jsonl_file" ]] || continue
+        if grep -q "\"${OLD_PATH}\"\\|\"${OLD_PATH}/" "$jsonl_file" 2>/dev/null; then
+            if [[ "$DRY_RUN" == true ]]; then
+                echo "[Would update] project session: $(basename "$jsonl_file")"
+            else
+                # Backup was already taken before the directory rename
+                # Replace path in quoted context or as prefix of sub-paths
+                sed -i "s|\"${OLD_SED}\"|\"${NEW_SED}\"|g; s|\"${OLD_SED}/|\"${NEW_SED}/|g" "$jsonl_file"
+                echo "[Updated] project session: $(basename "$jsonl_file")"
+            fi
+            changes=$((changes + 1))
+        fi
+    done
+fi
+
+# Also update sub-project session files
+for dir in "$PROJECTS_DIR"/${NEW_DIRNAME}-*; do
+    [[ -d "$dir" ]] || continue
+    for jsonl_file in "$dir"/*.jsonl; do
+        [[ -f "$jsonl_file" ]] || continue
+        if grep -q "\"${OLD_PATH}\"\\|\"${OLD_PATH}/" "$jsonl_file" 2>/dev/null; then
+            if [[ "$DRY_RUN" == true ]]; then
+                echo "[Would update] sub-project session: $(basename "$dir")/$(basename "$jsonl_file")"
+            else
+                sed -i "s|\"${OLD_SED}\"|\"${NEW_SED}\"|g; s|\"${OLD_SED}/|\"${NEW_SED}/|g" "$jsonl_file"
+                echo "[Updated] sub-project session: $(basename "$dir")/$(basename "$jsonl_file")"
+            fi
+            changes=$((changes + 1))
+        fi
+    done
+done
+
+# Success — disable the rollback trap and clean up backups
+if [[ "$DRY_RUN" == false ]]; then
+    trap - ERR
+    cleanup_backup
+fi
+
+echo ""
+if [[ "$DRY_RUN" == true ]]; then
+    echo "Dry run complete. $changes change(s) would be made."
+else
+    if [[ $changes -eq 0 ]]; then
+        echo "No Claude Code metadata found for $OLD_PATH"
+    else
+        echo "Done. $changes update(s) applied."
+        echo "You can now open Claude Code in $NEW_PATH and resume your sessions."
+    fi
+fi

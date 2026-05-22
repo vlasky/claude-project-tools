@@ -1,0 +1,594 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: claude-orphans [options]
+       claude-orphans fix <old-path> <new-path>
+       claude-orphans purge <path>
+       claude-orphans purge --all
+
+Finds orphaned Claude Code projects — those with metadata in ~/.claude/projects/
+but no corresponding directory on disk.
+
+Commands:
+  (none)                   List all orphaned projects
+  fix <old-path> <new>     Repoint an orphan's metadata to a new location
+  purge <path>             Delete an orphan's metadata permanently
+  purge --all              Delete all orphaned project metadata
+
+Options:
+  --dry-run    Preview what would be changed without making modifications
+  -y, --yes    Skip confirmation prompts
+  -h, --help   Show this help message
+
+Examples:
+  claude-orphans
+  claude-orphans fix /home/user/old-project /home/user/new-location
+  claude-orphans --dry-run fix /old/path /new/path
+  claude-orphans purge /home/user/deleted-project
+  claude-orphans purge --all
+EOF
+    exit 0
+}
+
+CLAUDE_DIR="${HOME}/.claude"
+PROJECTS_DIR="$CLAUDE_DIR/projects"
+
+DRY_RUN=false
+YES=false
+COMMAND=""
+FIX_OLD=""
+FIX_NEW=""
+PURGE_PATH=""
+PURGE_ALL=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=true; shift ;;
+        -y|--yes) YES=true; shift ;;
+        -h|--help) usage ;;
+        fix)
+            COMMAND="fix"
+            shift
+            if [[ $# -ge 2 ]]; then
+                FIX_OLD="$1"; shift
+                FIX_NEW="$1"; shift
+            else
+                echo "Error: 'fix' requires two arguments: <old-path> <new-path>" >&2
+                exit 1
+            fi
+            ;;
+        purge)
+            COMMAND="purge"
+            shift
+            if [[ $# -ge 1 && "$1" == "--all" ]]; then
+                PURGE_ALL=true; shift
+            elif [[ $# -ge 1 && "$1" != -* ]]; then
+                PURGE_PATH="$1"; shift
+            else
+                echo "Error: 'purge' requires a path argument or --all" >&2
+                exit 1
+            fi
+            ;;
+        -*) echo "Error: Unknown option $1" >&2; exit 1 ;;
+        *) echo "Error: Unknown argument $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ ! -d "$CLAUDE_DIR" ]]; then
+    echo "Error: ~/.claude directory not found" >&2
+    exit 1
+fi
+
+if [[ ! -d "$PROJECTS_DIR" ]]; then
+    echo "No projects directory found at $PROJECTS_DIR"
+    exit 0
+fi
+
+# Convert path to Claude's directory naming scheme: /foo/bar -> -foo-bar
+path_to_dirname() {
+    echo "$1" | sed 's|/|-|g'
+}
+
+# Extract the project path from session JSONL files inside a project metadata dir.
+# Falls back to decoding the dirname if no cwd is found in session data.
+extract_project_path() {
+    local proj_dir="$1"
+    local path=""
+
+    # Look inside JSONL files for cwd references
+    for jsonl in "$proj_dir"/*.jsonl; do
+        [[ -f "$jsonl" ]] || continue
+        path=$(grep -oP '"cwd"\s*:\s*"\K[^"]+' "$jsonl" 2>/dev/null | head -1)
+        if [[ -n "$path" ]]; then
+            echo "$path"
+            return
+        fi
+    done
+
+    # Check session JSON files that reference this project dirname
+    local dirname
+    dirname=$(basename "$proj_dir")
+    if [[ -d "$CLAUDE_DIR/sessions" ]]; then
+        for session_file in "$CLAUDE_DIR/sessions"/*.json; do
+            [[ -f "$session_file" ]] || continue
+            path=$(grep -oP '"cwd"\s*:\s*"\K[^"]+' "$session_file" 2>/dev/null | head -1)
+            if [[ -n "$path" ]]; then
+                local check_dirname
+                check_dirname=$(path_to_dirname "$path")
+                if [[ "$check_dirname" == "$dirname" ]]; then
+                    echo "$path"
+                    return
+                fi
+            fi
+        done
+    fi
+
+    # Last resort: check history.jsonl
+    if [[ -f "$CLAUDE_DIR/history.jsonl" ]]; then
+        while IFS= read -r candidate; do
+            local check_dirname
+            check_dirname=$(path_to_dirname "$candidate")
+            if [[ "$check_dirname" == "$dirname" ]]; then
+                echo "$candidate"
+                return
+            fi
+        done < <(grep -oP '"project"\s*:\s*"\K[^"]+' "$CLAUDE_DIR/history.jsonl" 2>/dev/null | sort -u)
+    fi
+
+    echo ""
+}
+
+# --- List orphans ---
+
+list_orphans() {
+    local found=0
+
+    for proj_dir in "$PROJECTS_DIR"/*/; do
+        [[ -d "$proj_dir" ]] || continue
+
+        local dirname
+        dirname=$(basename "$proj_dir")
+
+        local project_path
+        project_path=$(extract_project_path "$proj_dir")
+
+        if [[ -z "$project_path" ]]; then
+            echo "[unknown]  $dirname (could not determine original path)"
+            found=$((found + 1))
+            continue
+        fi
+
+        if [[ ! -d "$project_path" ]]; then
+            echo "[orphaned] $project_path"
+            echo "           metadata: projects/$dirname"
+            found=$((found + 1))
+        fi
+    done
+
+    echo ""
+    if [[ $found -eq 0 ]]; then
+        echo "No orphaned projects found."
+    else
+        echo "$found orphaned project(s) found."
+        echo "Use 'claude-orphans fix <old-path> <new-path>' to repoint metadata."
+        echo "Use 'claude-orphans purge <path>' to delete metadata permanently."
+    fi
+}
+
+# --- Fix orphan ---
+
+resolve_path() {
+    local path="$1"
+    if [[ "$path" != /* ]]; then
+        path="$PWD/$path"
+    fi
+    local result=""
+    local IFS='/'
+    local parts
+    read -ra parts <<< "$path"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ''|'.') continue ;;
+            '..')
+                result="${result%/*}"
+                ;;
+            *)
+                result="$result/$part"
+                ;;
+        esac
+    done
+    echo "${result:-/}"
+}
+
+sed_escape() {
+    printf '%s' "$1" | sed 's/[&/\]/\\&/g'
+}
+
+sed_escape_pattern() {
+    printf '%s' "$1" | sed 's/[][\/.^$*]/\\&/g'
+}
+
+fix_orphan() {
+    local old_path new_path
+    old_path=$(resolve_path "$FIX_OLD")
+    new_path=$(resolve_path "$FIX_NEW")
+    old_path="${old_path%/}"
+    new_path="${new_path%/}"
+
+    if [[ "$old_path" == "$new_path" ]]; then
+        echo "Error: Old and new paths are the same" >&2
+        exit 1
+    fi
+
+    local old_dirname new_dirname
+    old_dirname=$(path_to_dirname "$old_path")
+    new_dirname=$(path_to_dirname "$new_path")
+
+    # Verify this is actually an orphan
+    if [[ ! -d "$PROJECTS_DIR/$old_dirname" ]]; then
+        echo "Error: No metadata found for path: $old_path" >&2
+        echo "  (expected directory: $PROJECTS_DIR/$old_dirname)" >&2
+        exit 1
+    fi
+
+    if [[ -d "$old_path" ]]; then
+        echo "Error: $old_path still exists on disk — this is not an orphan" >&2
+        echo "Use 'claude-move' instead to move an existing project." >&2
+        exit 1
+    fi
+
+    if [[ ! -d "$new_path" ]]; then
+        echo "Error: New path does not exist: $new_path" >&2
+        echo "The new path must be an existing directory." >&2
+        exit 1
+    fi
+
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    # If destination has no existing metadata, delegate to claude-move
+    if [[ ! -d "$PROJECTS_DIR/$new_dirname" ]]; then
+        local move_script="$script_dir/claude-move"
+        if [[ ! -x "$move_script" ]]; then
+            echo "Error: claude-move not found at $move_script" >&2
+            exit 1
+        fi
+        local args=("--metadata-only")
+        if [[ "$DRY_RUN" == true ]]; then
+            args+=("--dry-run")
+        fi
+        args+=("$old_path" "$new_path")
+        exec "$move_script" "${args[@]}"
+    fi
+
+    # --- Destination already has metadata: merge ---
+
+    echo "Claude Code Orphan Fix (merge mode)"
+    echo "===================================="
+    echo "Orphan path:  $old_path"
+    echo "New path:     $new_path"
+    echo ""
+    echo "Destination already has metadata — merging orphan's sessions into it."
+    echo ""
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[DRY RUN MODE - no changes will be made]"
+        echo ""
+    fi
+
+    local OLD_SED NEW_SED
+    OLD_SED=$(sed_escape_pattern "$old_path")
+    NEW_SED=$(sed_escape "$new_path")
+
+    local changes=0
+    local old_proj_dir="$PROJECTS_DIR/$old_dirname"
+    local new_proj_dir="$PROJECTS_DIR/$new_dirname"
+
+    # Step 1: Merge session JSONL files from orphan into destination
+    for jsonl in "$old_proj_dir"/*.jsonl; do
+        [[ -f "$jsonl" ]] || continue
+        local basename_file
+        basename_file=$(basename "$jsonl")
+
+        if [[ "$DRY_RUN" == true ]]; then
+            if [[ -f "$new_proj_dir/$basename_file" ]]; then
+                echo "[Would merge] $basename_file (exists in both — orphan's copy will be renamed)"
+            else
+                echo "[Would move]  $basename_file -> projects/$new_dirname/"
+            fi
+        else
+            # Rewrite old paths to new paths in the file
+            sed -i "s|\"${OLD_SED}\"|\"${NEW_SED}\"|g; s|\"${OLD_SED}/|\"${NEW_SED}/|g" "$jsonl"
+
+            if [[ -f "$new_proj_dir/$basename_file" ]]; then
+                # Name collision: rename with prefix
+                local target="$new_proj_dir/merged-${basename_file}"
+                mv "$jsonl" "$target"
+                echo "[Merged] $basename_file -> merged-$basename_file"
+            else
+                mv "$jsonl" "$new_proj_dir/$basename_file"
+                echo "[Moved]  $basename_file -> projects/$new_dirname/"
+            fi
+        fi
+        changes=$((changes + 1))
+    done
+
+    # Step 1b: Merge memory directory if present
+    if [[ -d "$old_proj_dir/memory" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            echo "[Would merge] memory/"
+        else
+            if [[ ! -d "$new_proj_dir/memory" ]]; then
+                mv "$old_proj_dir/memory" "$new_proj_dir/memory"
+                echo "[Moved]  memory/ -> projects/$new_dirname/memory/"
+            else
+                # Merge individual memory files
+                for mem_file in "$old_proj_dir/memory"/*; do
+                    [[ -f "$mem_file" ]] || continue
+                    local mem_basename
+                    mem_basename=$(basename "$mem_file")
+                    if [[ -f "$new_proj_dir/memory/$mem_basename" ]]; then
+                        # Append orphan's memory content to existing
+                        cat "$mem_file" >> "$new_proj_dir/memory/$mem_basename"
+                        echo "[Appended] memory/$mem_basename"
+                    else
+                        mv "$mem_file" "$new_proj_dir/memory/$mem_basename"
+                        echo "[Moved]    memory/$mem_basename"
+                    fi
+                done
+                rm -rf "$old_proj_dir/memory"
+            fi
+        fi
+        changes=$((changes + 1))
+    fi
+
+    # Step 2: Remove the now-empty orphan metadata directory
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[Would remove] projects/$old_dirname"
+    else
+        rm -rf "$old_proj_dir"
+        echo "[Removed] projects/$old_dirname"
+    fi
+
+    # Step 3: Update session JSON files (cwd field)
+    if [[ -d "$CLAUDE_DIR/sessions" ]]; then
+        for session_file in "$CLAUDE_DIR/sessions"/*.json; do
+            [[ -f "$session_file" ]] || continue
+            if grep -q "\"${old_path}\"" "$session_file" 2>/dev/null; then
+                if [[ "$DRY_RUN" == true ]]; then
+                    echo "[Would update] sessions/$(basename "$session_file")"
+                else
+                    sed -i "s|\"${OLD_SED}\"|\"${NEW_SED}\"|g" "$session_file"
+                    echo "[Updated] sessions/$(basename "$session_file")"
+                fi
+                changes=$((changes + 1))
+            fi
+        done
+    fi
+
+    # Step 4: Update history.jsonl
+    local history_file="$CLAUDE_DIR/history.jsonl"
+    if [[ -f "$history_file" ]]; then
+        if grep -q "\"${old_path}\"" "$history_file" 2>/dev/null; then
+            if [[ "$DRY_RUN" == true ]]; then
+                local count
+                count=$(grep -c "\"${old_path}\"" "$history_file")
+                echo "[Would update] history.jsonl ($count lines)"
+            else
+                sed -i "s|\"${OLD_SED}\"|\"${NEW_SED}\"|g" "$history_file"
+                echo "[Updated] history.jsonl"
+            fi
+            changes=$((changes + 1))
+        fi
+    fi
+
+    echo ""
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "Dry run complete. $changes change(s) would be made."
+    else
+        echo "Done. $changes update(s) applied. Orphan metadata merged into projects/$new_dirname."
+    fi
+}
+
+# --- Purge orphan ---
+
+describe_project() {
+    local proj_dir="$1"
+    local session_count=0
+    local has_memory="no"
+
+    for f in "$proj_dir"/*.jsonl; do
+        [[ -f "$f" ]] && session_count=$((session_count + 1))
+    done
+
+    if [[ -d "$proj_dir/memory" ]]; then
+        has_memory="yes"
+    fi
+
+    echo "  Sessions: $session_count, Memory: $has_memory"
+}
+
+purge_single() {
+    local path="$1"
+    local dirname
+    dirname=$(path_to_dirname "$path")
+    local proj_dir="$PROJECTS_DIR/$dirname"
+
+    if [[ ! -d "$proj_dir" ]]; then
+        echo "Error: No metadata found for path: $path" >&2
+        echo "  (expected directory: $proj_dir)" >&2
+        return 1
+    fi
+
+    if [[ -d "$path" ]]; then
+        echo "Error: $path still exists on disk — this is not an orphan" >&2
+        return 1
+    fi
+
+    echo "Orphan: $path"
+    describe_project "$proj_dir"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [Would delete] projects/$dirname"
+
+        # Check for session/history references
+        local OLD_SED
+        OLD_SED=$(sed_escape_pattern "$path")
+        if [[ -d "$CLAUDE_DIR/sessions" ]]; then
+            for session_file in "$CLAUDE_DIR/sessions"/*.json; do
+                [[ -f "$session_file" ]] || continue
+                if grep -q "\"${path}\"" "$session_file" 2>/dev/null; then
+                    echo "  [Would clean] sessions/$(basename "$session_file")"
+                fi
+            done
+        fi
+        if [[ -f "$CLAUDE_DIR/history.jsonl" ]]; then
+            if grep -q "\"${path}\"" "$CLAUDE_DIR/history.jsonl" 2>/dev/null; then
+                local count
+                count=$(grep -c "\"${path}\"" "$CLAUDE_DIR/history.jsonl")
+                echo "  [Would clean] history.jsonl ($count lines)"
+            fi
+        fi
+        return 0
+    fi
+
+    # Confirmation
+    if [[ "$YES" != true ]]; then
+        printf "  Delete this metadata permanently? [y/N] "
+        read -r reply
+        if [[ "$reply" != [yY] && "$reply" != [yY][eE][sS] ]]; then
+            echo "  Skipped."
+            return 0
+        fi
+    fi
+
+    # Delete project metadata
+    rm -rf "$proj_dir"
+    echo "  [Deleted] projects/$dirname"
+
+    # Clean references from session files
+    if [[ -d "$CLAUDE_DIR/sessions" ]]; then
+        local OLD_SED
+        OLD_SED=$(sed_escape_pattern "$path")
+        for session_file in "$CLAUDE_DIR/sessions"/*.json; do
+            [[ -f "$session_file" ]] || continue
+            if grep -q "\"${path}\"" "$session_file" 2>/dev/null; then
+                rm "$session_file"
+                echo "  [Cleaned] sessions/$(basename "$session_file")"
+            fi
+        done
+    fi
+
+    # Clean references from history.jsonl
+    if [[ -f "$CLAUDE_DIR/history.jsonl" ]]; then
+        if grep -q "\"${path}\"" "$CLAUDE_DIR/history.jsonl" 2>/dev/null; then
+            local OLD_SED
+            OLD_SED=$(sed_escape_pattern "$path")
+            sed -i "/\"${OLD_SED}\"/d" "$CLAUDE_DIR/history.jsonl"
+            echo "  [Cleaned] history.jsonl"
+        fi
+    fi
+}
+
+purge_orphan() {
+    if [[ "$PURGE_ALL" == true ]]; then
+        # Collect all orphans first
+        local orphans=()
+        for proj_dir in "$PROJECTS_DIR"/*/; do
+            [[ -d "$proj_dir" ]] || continue
+            local project_path
+            project_path=$(extract_project_path "$proj_dir")
+            if [[ -z "$project_path" ]]; then
+                orphans+=("$proj_dir")
+            elif [[ ! -d "$project_path" ]]; then
+                orphans+=("$project_path")
+            fi
+        done
+
+        if [[ ${#orphans[@]} -eq 0 ]]; then
+            echo "No orphaned projects found."
+            return
+        fi
+
+        echo "Found ${#orphans[@]} orphaned project(s):"
+        echo ""
+
+        if [[ "$DRY_RUN" == true ]]; then
+            for orphan in "${orphans[@]}"; do
+                if [[ -d "$orphan" ]]; then
+                    # This is a proj_dir where we couldn't determine the path
+                    local dirname
+                    dirname=$(basename "$orphan")
+                    echo "[unknown] $dirname (could not determine original path)"
+                    describe_project "$orphan"
+                    echo "  [Would delete] projects/$dirname"
+                else
+                    purge_single "$orphan"
+                fi
+                echo ""
+            done
+            echo "Dry run complete."
+            return
+        fi
+
+        # Show summary and confirm all at once
+        for orphan in "${orphans[@]}"; do
+            if [[ -d "$orphan" ]]; then
+                local dirname
+                dirname=$(basename "$orphan")
+                echo "  [unknown] $dirname"
+                describe_project "$orphan"
+            else
+                echo "  $orphan"
+                local dirname
+                dirname=$(path_to_dirname "$orphan")
+                describe_project "$PROJECTS_DIR/$dirname"
+            fi
+        done
+        echo ""
+
+        if [[ "$YES" != true ]]; then
+            printf "Delete ALL orphaned project metadata permanently? [y/N] "
+            read -r reply
+            if [[ "$reply" != [yY] && "$reply" != [yY][eE][sS] ]]; then
+                echo "Aborted."
+                return
+            fi
+        fi
+
+        echo ""
+        local old_yes="$YES"
+        YES=true
+        for orphan in "${orphans[@]}"; do
+            if [[ -d "$orphan" ]]; then
+                # Unknown path — just delete the metadata dir directly
+                local dirname
+                dirname=$(basename "$orphan")
+                rm -rf "$orphan"
+                echo "[Deleted] projects/$dirname"
+            else
+                purge_single "$orphan"
+            fi
+            echo ""
+        done
+        YES="$old_yes"
+        echo "Done. All orphaned project metadata removed."
+    else
+        local purge_path
+        purge_path=$(resolve_path "$PURGE_PATH")
+        purge_path="${purge_path%/}"
+        purge_single "$purge_path"
+    fi
+}
+
+# --- Main ---
+
+if [[ "$COMMAND" == "fix" ]]; then
+    fix_orphan
+elif [[ "$COMMAND" == "purge" ]]; then
+    purge_orphan
+else
+    list_orphans
+fi
